@@ -69,12 +69,12 @@ public:
         try {
             // Read length and copy from JS heap to C++ heap
             unsigned int length = uint8Array["length"].as<unsigned int>();
-            std::vector<uint8_t> data(length);
+            inputBuffer_.resize(length);
 
-            // Create a view into WASM memory at the location of our vector
+            // Create a view into WASM memory at the location of our buffer
             val memoryView = val::global("Uint8Array").new_(
                 val::module_property("HEAPU8")["buffer"],
-                reinterpret_cast<uintptr_t>(data.data()),
+                reinterpret_cast<uintptr_t>(inputBuffer_.data()),
                 length
             );
             // Copy the JS Uint8Array into our WASM memory
@@ -84,7 +84,7 @@ public:
             qpdf_ = std::make_unique<QPDF>();
             qpdf_->processMemoryFile(
                 "input.pdf",
-                reinterpret_cast<char const*>(data.data()),
+                reinterpret_cast<char const*>(inputBuffer_.data()),
                 length,
                 nullptr  // no password
             );
@@ -108,12 +108,12 @@ public:
         try {
             // Read length and copy from JS heap to C++ heap
             unsigned int length = uint8Array["length"].as<unsigned int>();
-            std::vector<uint8_t> data(length);
+            inputBuffer_.resize(length);
 
-            // Create a view into WASM memory at the location of our vector
+            // Create a view into WASM memory at the location of our buffer
             val memoryView = val::global("Uint8Array").new_(
                 val::module_property("HEAPU8")["buffer"],
-                reinterpret_cast<uintptr_t>(data.data()),
+                reinterpret_cast<uintptr_t>(inputBuffer_.data()),
                 length
             );
             // Copy the JS Uint8Array into our WASM memory
@@ -123,7 +123,7 @@ public:
             qpdf_ = std::make_unique<QPDF>();
             qpdf_->processMemoryFile(
                 "input.pdf",
-                reinterpret_cast<char const*>(data.data()),
+                reinterpret_cast<char const*>(inputBuffer_.data()),
                 length,
                 password.c_str()
             );
@@ -436,8 +436,7 @@ public:
         try {
             QPDFWriter writer(*qpdf_);
             writer.setOutputMemory();
-            // Don't re-decode streams we've already set up
-            writer.setDecodeLevel(qpdf_dl_none);
+            // Use default decode level - QPDFWriter handles replaced streams correctly
             writer.write();
 
             std::shared_ptr<Buffer> buf = writer.getBufferSharedPointer();
@@ -465,6 +464,8 @@ public:
         }
         closed_ = true;
         qpdf_.reset();
+        inputBuffer_.clear();
+        inputBuffer_.shrink_to_fit();
         outputBuffer_.clear();
         outputBuffer_.shrink_to_fit();
     }
@@ -484,6 +485,7 @@ public:
 
 private:
     std::unique_ptr<QPDF> qpdf_;
+    std::vector<uint8_t> inputBuffer_;   // Keeps PDF data alive for qpdf
     std::vector<uint8_t> outputBuffer_;  // Keeps typed_memory_view valid
     bool closed_;
 };
