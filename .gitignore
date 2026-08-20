@@ -1,0 +1,22 @@
+# Build output
+dist/
+out/
+
+# Dependencies
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+
+# TypeScript build info
+*.tsbuildinfo

@@ -1,16 +1,20 @@
 /**
  * qpdf WASM Wrapper for Image Stream Manipulation
  *
- * This thin C++ wrapper exposes qpdf's library API for use from JavaScript/TypeScript
- * via Emscripten's embind. It provides the minimal surface needed to:
+ * Thin C++ wrapper using Emscripten Embind to expose qpdf's library API
+ * to JavaScript/TypeScript. Uses emscripten::val for input (Uint8Array from JS)
+ * and typed_memory_view for zero-copy binary output.
  *
- * 1. Load a PDF from a memory buffer
+ * Operations:
+ * 1. Load a PDF from a Uint8Array (with optional password)
  * 2. Enumerate image XObjects (with metadata)
- * 3. Read image stream data
- * 4. Replace image stream data
- * 5. Write the modified PDF to a memory buffer
+ * 3. Read decoded or raw image stream data
+ * 4. Replace image stream data with new content and metadata
+ * 5. Write the modified PDF to a Uint8Array
+ * 6. Explicit close() for memory management
  *
- * The wrapper does NOT duplicate any PDF logic - it delegates entirely to qpdf.
+ * The wrapper catches all C++ exceptions at the boundary and returns
+ * structured result objects {success, error} to JavaScript.
  */
 
 #include <emscripten/bind.h>
@@ -27,284 +31,449 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <set>
 
 using namespace emscripten;
 
-// --- Data structures exposed to JavaScript ---
+// --- Helper: create a success result ---
+static val makeSuccess() {
+    val result = val::object();
+    result.set("success", true);
+    return result;
+}
 
-struct ImageInfo {
-    int objId;
-    int generation;
-    int width;
-    int height;
-    int bitsPerComponent;
-    std::string colorSpace;
-    std::string filter;
-    size_t streamLength;
-};
-
-struct PdfResult {
-    bool success;
-    std::string error;
-    // For operations that return binary data, it's transferred via separate methods
-};
+// --- Helper: create an error result ---
+static val makeError(std::string const& message) {
+    val result = val::object();
+    result.set("success", false);
+    result.set("error", val(message));
+    return result;
+}
 
 // --- Main wrapper class ---
 
-class QpdfWrapper {
+class QpdfWasmWrapper {
 public:
-    QpdfWrapper() : qpdf_(std::make_unique<QPDF>()) {}
+    QpdfWasmWrapper() : qpdf_(nullptr), closed_(false) {}
 
     /**
-     * Load a PDF from a memory buffer.
-     * The data is copied into qpdf's internal structures.
+     * Load a PDF from a Uint8Array (JS).
+     * Copies data from JS heap to C++ heap, then calls processMemoryFile.
+     * Returns {success: true} or {success: false, error: "..."}
      */
-    PdfResult loadPdf(std::string pdfData) {
-        PdfResult result{true, ""};
+    val loadPdf(val uint8Array) {
+        if (closed_) {
+            return makeError("Instance has been disposed");
+        }
+
         try {
+            // Read length and copy from JS heap to C++ heap
+            unsigned int length = uint8Array["length"].as<unsigned int>();
+            std::vector<uint8_t> data(length);
+
+            // Create a view into WASM memory at the location of our vector
+            val memoryView = val::global("Uint8Array").new_(
+                val::module_property("HEAPU8")["buffer"],
+                reinterpret_cast<uintptr_t>(data.data()),
+                length
+            );
+            // Copy the JS Uint8Array into our WASM memory
+            memoryView.call<void>("set", uint8Array);
+
+            // Create a fresh QPDF instance
             qpdf_ = std::make_unique<QPDF>();
             qpdf_->processMemoryFile(
                 "input.pdf",
-                pdfData.c_str(),
-                pdfData.size(),
+                reinterpret_cast<char const*>(data.data()),
+                length,
                 nullptr  // no password
             );
+
+            return makeSuccess();
         } catch (std::exception const& e) {
-            result.success = false;
-            result.error = e.what();
+            qpdf_.reset();
+            return makeError(e.what());
         }
-        return result;
     }
 
     /**
-     * Load an encrypted PDF from a memory buffer.
+     * Load an encrypted PDF from a Uint8Array with a password.
+     * Returns {success: true} or {success: false, error: "..."}
      */
-    PdfResult loadPdfWithPassword(std::string pdfData, std::string password) {
-        PdfResult result{true, ""};
+    val loadPdfWithPassword(val uint8Array, std::string password) {
+        if (closed_) {
+            return makeError("Instance has been disposed");
+        }
+
         try {
+            // Read length and copy from JS heap to C++ heap
+            unsigned int length = uint8Array["length"].as<unsigned int>();
+            std::vector<uint8_t> data(length);
+
+            // Create a view into WASM memory at the location of our vector
+            val memoryView = val::global("Uint8Array").new_(
+                val::module_property("HEAPU8")["buffer"],
+                reinterpret_cast<uintptr_t>(data.data()),
+                length
+            );
+            // Copy the JS Uint8Array into our WASM memory
+            memoryView.call<void>("set", uint8Array);
+
+            // Create a fresh QPDF instance
             qpdf_ = std::make_unique<QPDF>();
             qpdf_->processMemoryFile(
                 "input.pdf",
-                pdfData.c_str(),
-                pdfData.size(),
+                reinterpret_cast<char const*>(data.data()),
+                length,
                 password.c_str()
             );
+
+            return makeSuccess();
         } catch (std::exception const& e) {
-            result.success = false;
-            result.error = e.what();
+            qpdf_.reset();
+            return makeError(e.what());
         }
-        return result;
     }
 
     /**
      * Get a list of all images in the PDF with their metadata.
-     * Iterates all pages and (optionally recursively) all form XObjects.
+     * Returns a JS array of ImageInfo objects.
+     *
+     * Each ImageInfo has: objId, generation, width, height,
+     * bitsPerComponent (int|null), colorSpace (string|null),
+     * filter (string|null), streamLength.
+     *
+     * Deduplicates across pages using objId+generation.
+     * When recursive=true, traverses Form XObjects (qpdf handles depth internally).
      */
-    std::vector<ImageInfo> getImages(bool recursive) {
-        std::vector<ImageInfo> images;
-        if (!qpdf_) return images;
+    val getImages(bool recursive) {
+        if (closed_) {
+            return makeError("Instance has been disposed");
+        }
+        if (!qpdf_) {
+            return makeError("No PDF loaded");
+        }
+
+        val result = val::array();
+        std::set<QPDFObjGen> seen;
 
         try {
-            QPDFPageDocumentHelper dh(*qpdf_);
-            // Track already-seen objects to avoid duplicates
-            std::set<QPDFObjGen> seen;
+            QPDFPageDocumentHelper pdh(*qpdf_);
+            auto pages = pdh.getAllPages();
 
-            for (auto& page : dh.getAllPages()) {
-                page.forEachImage(recursive,
-                    [&](QPDFObjectHandle& obj, QPDFObjectHandle&, std::string const&) {
-                        QPDFObjGen og(obj);
-                        if (seen.count(og)) return;
+            for (auto& page : pages) {
+                page.forEachImage(
+                    recursive,
+                    [&result, &seen](QPDFObjectHandle& obj,
+                                     QPDFObjectHandle& /*xobj_dict*/,
+                                     std::string const& /*key*/) {
+                        // Deduplicate across pages
+                        QPDFObjGen og = obj.getObjGen();
+                        if (seen.count(og) > 0) {
+                            return;
+                        }
                         seen.insert(og);
 
-                        ImageInfo info;
-                        info.objId = obj.getObjectID();
-                        info.generation = obj.getGeneration();
-
+                        // Get stream dictionary
                         QPDFObjectHandle dict = obj.getDict();
-                        info.width = dict.getKey("/Width").getIntValueAsInt();
-                        info.height = dict.getKey("/Height").getIntValueAsInt();
-                        info.bitsPerComponent = dict.getKey("/BitsPerComponent").getIntValueAsInt();
 
-                        QPDFObjectHandle cs = dict.getKey("/ColorSpace");
-                        if (cs.isName()) {
-                            info.colorSpace = cs.getName();
+                        // Build ImageInfo object
+                        val info = val::object();
+                        info.set("objId", obj.getObjectID());
+                        info.set("generation", obj.getGeneration());
+
+                        // Width and Height (required fields)
+                        QPDFObjectHandle widthObj = dict.getKey("/Width");
+                        info.set("width", widthObj.isInteger()
+                            ? static_cast<int>(widthObj.getIntValue()) : 0);
+
+                        QPDFObjectHandle heightObj = dict.getKey("/Height");
+                        info.set("height", heightObj.isInteger()
+                            ? static_cast<int>(heightObj.getIntValue()) : 0);
+
+                        // BitsPerComponent (optional - null if missing)
+                        QPDFObjectHandle bpcObj = dict.getKey("/BitsPerComponent");
+                        if (bpcObj.isNull()) {
+                            info.set("bitsPerComponent", val::null());
                         } else {
-                            info.colorSpace = cs.unparse();
+                            info.set("bitsPerComponent",
+                                bpcObj.isInteger()
+                                    ? static_cast<int>(bpcObj.getIntValue()) : 0);
                         }
 
-                        QPDFObjectHandle f = dict.getKey("/Filter");
-                        if (f.isName()) {
-                            info.filter = f.getName();
-                        } else if (f.isArray()) {
-                            info.filter = f.unparse();
+                        // ColorSpace (optional - null if missing)
+                        QPDFObjectHandle csObj = dict.getKey("/ColorSpace");
+                        if (csObj.isNull()) {
+                            info.set("colorSpace", val::null());
+                        } else if (csObj.isName()) {
+                            info.set("colorSpace", val(csObj.getName()));
                         } else {
-                            info.filter = "";
+                            // Array or other complex type - unparse to string
+                            info.set("colorSpace", val(csObj.unparse()));
                         }
 
-                        // Get raw stream length from /Length key
-                        info.streamLength = static_cast<size_t>(
-                            dict.getKey("/Length").getIntValue());
+                        // Filter (optional - null if missing)
+                        QPDFObjectHandle filterObj = dict.getKey("/Filter");
+                        if (filterObj.isNull()) {
+                            info.set("filter", val::null());
+                        } else if (filterObj.isName()) {
+                            info.set("filter", val(filterObj.getName()));
+                        } else {
+                            // Array or other type - unparse to string
+                            info.set("filter", val(filterObj.unparse()));
+                        }
 
-                        images.push_back(info);
-                    }
-                );
+                        // Stream length (encoded/raw byte length)
+                        QPDFObjectHandle lengthObj = dict.getKey("/Length");
+                        info.set("streamLength", lengthObj.isInteger()
+                            ? static_cast<int>(lengthObj.getIntValue()) : 0);
+
+                        result.call<void>("push", info);
+                    });
             }
-        } catch (std::exception const&) {
-            // Return what we have so far
+        } catch (std::exception const& /*e*/) {
+            // Return images collected so far on error
         }
-        return images;
+
+        return result;
     }
 
     /**
      * Read the decoded (uncompressed) image stream data for a given object.
-     * Returns the raw pixel data as a string (binary).
+     * Returns a typed_memory_view as Uint8Array.
+     * Decodes all filters (Flate, DCT, etc.) to produce raw pixel data.
      */
-    std::string getImageStreamData(int objId, int generation) {
-        if (!qpdf_) return "";
-
-        try {
-            QPDFObjectHandle obj = qpdf_->getObjectByID(objId, generation);
-            if (!obj.isStream()) return "";
-
-            // Decode all filters including DCT (lossy)
-            std::shared_ptr<Buffer> buf = obj.getStreamData(qpdf_dl_all);
-            return std::string(
-                reinterpret_cast<char const*>(buf->getBuffer()),
-                buf->getSize()
-            );
-        } catch (std::exception const&) {
-            return "";
+    val getImageStreamData(int objId, int generation) {
+        if (closed_) {
+            return makeError("Instance has been disposed");
         }
-    }
-
-    /**
-     * Read the raw (compressed/encoded) stream data without decoding.
-     */
-    std::string getRawImageStreamData(int objId, int generation) {
-        if (!qpdf_) return "";
-
-        try {
-            QPDFObjectHandle obj = qpdf_->getObjectByID(objId, generation);
-            if (!obj.isStream()) return "";
-
-            std::shared_ptr<Buffer> buf = obj.getRawStreamData();
-            return std::string(
-                reinterpret_cast<char const*>(buf->getBuffer()),
-                buf->getSize()
-            );
-        } catch (std::exception const&) {
-            return "";
-        }
-    }
-
-    /**
-     * Replace an image stream with new data.
-     *
-     * @param objId         Object ID of the image stream
-     * @param generation    Generation number
-     * @param newData       New stream data (raw bytes as string)
-     * @param width         New width (0 = keep existing)
-     * @param height        New height (0 = keep existing)
-     * @param bitsPerComponent  New BPC (0 = keep existing)
-     * @param colorSpace    New color space name (empty = keep existing)
-     * @param filter        New filter name (empty = no filter/raw data)
-     */
-    PdfResult replaceImageStream(
-        int objId,
-        int generation,
-        std::string newData,
-        int width,
-        int height,
-        int bitsPerComponent,
-        std::string colorSpace,
-        std::string filter)
-    {
-        PdfResult result{true, ""};
         if (!qpdf_) {
-            result.success = false;
-            result.error = "No PDF loaded";
-            return result;
+            return makeError("No PDF loaded");
         }
 
         try {
             QPDFObjectHandle obj = qpdf_->getObjectByID(objId, generation);
             if (!obj.isStream()) {
-                result.success = false;
-                result.error = "Object is not a stream";
-                return result;
+                return makeError("Object " + std::to_string(objId) + " " + std::to_string(generation) + " is not a stream");
             }
 
-            // Create Buffer from the new data
-            auto buf = std::make_shared<Buffer>(newData.size());
-            std::memcpy(buf->getBuffer(), newData.data(), newData.size());
+            // Decode all filters to get raw pixel data
+            std::shared_ptr<Buffer> buf = obj.getStreamData(qpdf_dl_all);
 
-            // Determine filter and decode_parms for replaceStreamData
-            QPDFObjectHandle filterObj;
+            // Copy into member buffer so the typed_memory_view stays valid
+            outputBuffer_.assign(buf->getBuffer(), buf->getBuffer() + buf->getSize());
+
+            return val(typed_memory_view(outputBuffer_.size(), outputBuffer_.data()));
+        } catch (std::exception const& e) {
+            return makeError(e.what());
+        }
+    }
+
+    /**
+     * Read the raw (compressed/encoded) stream data without decoding.
+     * Returns a typed_memory_view as Uint8Array.
+     * Returns the stream bytes as-is (no filter decoding applied).
+     */
+    val getRawImageStreamData(int objId, int generation) {
+        if (closed_) {
+            return makeError("Instance has been disposed");
+        }
+        if (!qpdf_) {
+            return makeError("No PDF loaded");
+        }
+
+        try {
+            QPDFObjectHandle obj = qpdf_->getObjectByID(objId, generation);
+            if (!obj.isStream()) {
+                return makeError("Object " + std::to_string(objId) + " " + std::to_string(generation) + " is not a stream");
+            }
+
+            // Get raw stream data without any decoding
+            std::shared_ptr<Buffer> buf = obj.getRawStreamData();
+
+            // Copy into member buffer so the typed_memory_view stays valid
+            outputBuffer_.assign(buf->getBuffer(), buf->getBuffer() + buf->getSize());
+
+            return val(typed_memory_view(outputBuffer_.size(), outputBuffer_.data()));
+        } catch (std::exception const& e) {
+            return makeError(e.what());
+        }
+    }
+
+    /**
+     * Replace an image stream with new data and metadata.
+     * Accepts Uint8Array for data and a val object for metadata.
+     *
+     * Metadata fields:
+     *   width (int): 0 means keep existing
+     *   height (int): 0 means keep existing
+     *   bitsPerComponent (int): 0 means keep existing
+     *   colorSpace (string): empty means keep existing
+     *   filter (string): empty means keep existing
+     *
+     * Always updates /Length to the new data byte length.
+     * Returns {success: true} or {success: false, error: "..."}.
+     */
+    val replaceImageStream(int objId, int generation, val uint8Array, val metadata) {
+        if (closed_) {
+            return makeError("Instance has been disposed");
+        }
+        if (!qpdf_) {
+            return makeError("No PDF loaded");
+        }
+
+        try {
+            // Get the object and verify it's a stream
+            QPDFObjectHandle obj = qpdf_->getObjectByID(objId, generation);
+            if (!obj.isStream()) {
+                return makeError("Object is not a stream");
+            }
+
+            // Copy the Uint8Array from JS to C++
+            unsigned int length = uint8Array["length"].as<unsigned int>();
+            std::vector<uint8_t> data(length);
+
+            val memoryView = val::global("Uint8Array").new_(
+                val::module_property("HEAPU8")["buffer"],
+                reinterpret_cast<uintptr_t>(data.data()),
+                length
+            );
+            memoryView.call<void>("set", uint8Array);
+
+            // Read metadata fields from the val object
+            int width = metadata["width"].as<int>();
+            int height = metadata["height"].as<int>();
+            int bitsPerComponent = metadata["bitsPerComponent"].as<int>();
+            std::string colorSpace = metadata["colorSpace"].as<std::string>();
+            std::string filter = metadata["filter"].as<std::string>();
+
+            // Determine the filter object for replaceStreamData
+            QPDFObjectHandle filterObj = QPDFObjectHandle::newNull();
             QPDFObjectHandle decodeParms = QPDFObjectHandle::newNull();
 
-            if (filter.empty()) {
-                // No filter - raw uncompressed data
-                filterObj = QPDFObjectHandle::newNull();
-            } else {
+            if (!filter.empty()) {
+                // Use the provided filter
                 filterObj = QPDFObjectHandle::newName(filter);
+            } else {
+                // Keep the original filter if it exists
+                QPDFObjectHandle dict = obj.getDict();
+                if (dict.hasKey("/Filter")) {
+                    filterObj = dict.getKey("/Filter");
+                }
+                if (dict.hasKey("/DecodeParms")) {
+                    decodeParms = dict.getKey("/DecodeParms");
+                }
             }
+
+            // Create the buffer for replaceStreamData
+            auto buf = std::make_shared<Buffer>(data.size());
+            std::memcpy(buf->getBuffer(), data.data(), data.size());
 
             // Replace the stream data
             obj.replaceStreamData(buf, filterObj, decodeParms);
 
-            // Update the stream dictionary metadata
+            // Update dictionary keys
             QPDFObjectHandle dict = obj.getDict();
+
+            // Always update /Length to the new data byte length
+            dict.replaceKey("/Length",
+                QPDFObjectHandle::newInteger(static_cast<long long>(length)));
+
+            // Update /Width only if metadata width > 0
             if (width > 0) {
-                dict.replaceKey("/Width", QPDFObjectHandle::newInteger(width));
+                dict.replaceKey("/Width",
+                    QPDFObjectHandle::newInteger(width));
             }
+
+            // Update /Height only if metadata height > 0
             if (height > 0) {
-                dict.replaceKey("/Height", QPDFObjectHandle::newInteger(height));
+                dict.replaceKey("/Height",
+                    QPDFObjectHandle::newInteger(height));
             }
+
+            // Update /BitsPerComponent only if metadata bitsPerComponent > 0
             if (bitsPerComponent > 0) {
                 dict.replaceKey("/BitsPerComponent",
                     QPDFObjectHandle::newInteger(bitsPerComponent));
             }
+
+            // Update /ColorSpace only if metadata colorSpace is non-empty
             if (!colorSpace.empty()) {
                 dict.replaceKey("/ColorSpace",
-                    QPDFObjectHandle::newName(colorSpace));
+                    QPDFObjectHandle::newName("/" + colorSpace));
             }
 
+            // Update /Filter only if metadata filter is non-empty
+            if (!filter.empty()) {
+                dict.replaceKey("/Filter",
+                    QPDFObjectHandle::newName(filter));
+            }
+
+            return makeSuccess();
         } catch (std::exception const& e) {
-            result.success = false;
-            result.error = e.what();
+            return makeError(e.what());
         }
-        return result;
     }
 
     /**
-     * Write the (modified) PDF to a memory buffer and return it.
+     * Write the (modified) PDF to a memory buffer.
+     * Returns a typed_memory_view as Uint8Array that remains valid until
+     * the next call that modifies outputBuffer_.
+     *
+     * Uses QPDFWriter with setOutputMemory() to serialize the PDF in memory.
+     * The result is copied into outputBuffer_ so that the typed_memory_view
+     * pointer remains valid until the caller copies it out (or until the next
+     * call that overwrites outputBuffer_).
      */
-    std::string writePdf() {
-        if (!qpdf_) return "";
+    val writePdf() {
+        if (closed_) {
+            return makeError("Instance has been disposed");
+        }
+        if (!qpdf_) {
+            return makeError("No PDF loaded");
+        }
 
         try {
             QPDFWriter writer(*qpdf_);
             writer.setOutputMemory();
-            // Don't try to recompress streams we've already set up
-            writer.setCompressStreams(true);
+            // Don't re-decode streams we've already set up
             writer.setDecodeLevel(qpdf_dl_none);
             writer.write();
 
             std::shared_ptr<Buffer> buf = writer.getBufferSharedPointer();
-            return std::string(
-                reinterpret_cast<char const*>(buf->getBuffer()),
-                buf->getSize()
+
+            // Copy into member buffer so the typed_memory_view stays valid
+            outputBuffer_.assign(
+                buf->getBuffer(),
+                buf->getBuffer() + buf->getSize()
             );
-        } catch (std::exception const&) {
-            return "";
+
+            return val(typed_memory_view(outputBuffer_.size(), outputBuffer_.data()));
+        } catch (std::exception const& e) {
+            return makeError(e.what());
         }
+    }
+
+    /**
+     * Release all resources held by the QPDF instance.
+     * After close(), all methods return a disposed error.
+     * Multiple close() calls are no-ops.
+     */
+    void close() {
+        if (closed_) {
+            return;  // no-op on subsequent calls
+        }
+        closed_ = true;
+        qpdf_.reset();
+        outputBuffer_.clear();
+        outputBuffer_.shrink_to_fit();
     }
 
     /**
      * Get the number of pages in the loaded PDF.
      */
     int getPageCount() {
-        if (!qpdf_) return 0;
+        if (closed_ || !qpdf_) return 0;
         try {
             return static_cast<int>(
                 QPDFPageDocumentHelper(*qpdf_).getAllPages().size());
@@ -315,35 +484,25 @@ public:
 
 private:
     std::unique_ptr<QPDF> qpdf_;
+    std::vector<uint8_t> outputBuffer_;  // Keeps typed_memory_view valid
+    bool closed_;
 };
 
 // --- Embind bindings ---
+// All methods use emscripten::val for structured JS interop.
+// No value_object or register_vector needed: all I/O is via val objects
+// and typed_memory_view for binary data output.
 
 EMSCRIPTEN_BINDINGS(qpdf_wrapper) {
-    value_object<ImageInfo>("ImageInfo")
-        .field("objId", &ImageInfo::objId)
-        .field("generation", &ImageInfo::generation)
-        .field("width", &ImageInfo::width)
-        .field("height", &ImageInfo::height)
-        .field("bitsPerComponent", &ImageInfo::bitsPerComponent)
-        .field("colorSpace", &ImageInfo::colorSpace)
-        .field("filter", &ImageInfo::filter)
-        .field("streamLength", &ImageInfo::streamLength);
-
-    value_object<PdfResult>("PdfResult")
-        .field("success", &PdfResult::success)
-        .field("error", &PdfResult::error);
-
-    register_vector<ImageInfo>("VectorImageInfo");
-
-    class_<QpdfWrapper>("QpdfWrapper")
+    class_<QpdfWasmWrapper>("QpdfWasmWrapper")
         .constructor<>()
-        .function("loadPdf", &QpdfWrapper::loadPdf)
-        .function("loadPdfWithPassword", &QpdfWrapper::loadPdfWithPassword)
-        .function("getImages", &QpdfWrapper::getImages)
-        .function("getImageStreamData", &QpdfWrapper::getImageStreamData)
-        .function("getRawImageStreamData", &QpdfWrapper::getRawImageStreamData)
-        .function("replaceImageStream", &QpdfWrapper::replaceImageStream)
-        .function("writePdf", &QpdfWrapper::writePdf)
-        .function("getPageCount", &QpdfWrapper::getPageCount);
+        .function("loadPdf", &QpdfWasmWrapper::loadPdf)
+        .function("loadPdfWithPassword", &QpdfWasmWrapper::loadPdfWithPassword)
+        .function("getImages", &QpdfWasmWrapper::getImages)
+        .function("getImageStreamData", &QpdfWasmWrapper::getImageStreamData)
+        .function("getRawImageStreamData", &QpdfWasmWrapper::getRawImageStreamData)
+        .function("replaceImageStream", &QpdfWasmWrapper::replaceImageStream)
+        .function("writePdf", &QpdfWasmWrapper::writePdf)
+        .function("close", &QpdfWasmWrapper::close)
+        .function("getPageCount", &QpdfWasmWrapper::getPageCount);
 }

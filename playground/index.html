@@ -1,0 +1,419 @@
+<!--
+  This page requires a local HTTP server (ES modules don't work from file://).
+  Run from project root: npm run playground
+  Then open: http://localhost:3000/playground/
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>qpdf-image-streams Playground</title>
+    <style>
+        *, *::before, *::after {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+            color: #1a1a1a;
+            line-height: 1.5;
+        }
+
+        h1 {
+            margin-bottom: 0.25rem;
+        }
+
+        .subtitle {
+            color: #555;
+            margin-top: 0;
+            margin-bottom: 2rem;
+        }
+
+        section {
+            margin-bottom: 1.5rem;
+        }
+
+        label[for="pdf-input"] {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        input[type="file"] {
+            display: block;
+        }
+
+        .drop-zone {
+            border: 2px dashed #aaa;
+            border-radius: 8px;
+            padding: 2rem;
+            text-align: center;
+            color: #666;
+            margin-top: 0.75rem;
+            transition: border-color 0.15s, background-color 0.15s;
+        }
+
+        .drop-zone.dragover {
+            border-color: #2563eb;
+            background-color: #eff6ff;
+        }
+
+        #status {
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            display: none;
+        }
+
+        #status.info {
+            display: block;
+            background-color: #dbeafe;
+            color: #1e40af;
+        }
+
+        #status.success {
+            display: block;
+            background-color: #dcfce7;
+            color: #166534;
+        }
+
+        #status.error {
+            display: block;
+            background-color: #fee2e2;
+            color: #991b1b;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+            margin-bottom: 1rem;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        th {
+            background-color: #f9fafb;
+            font-weight: 600;
+        }
+
+        tr:hover td {
+            background-color: #f3f4f6;
+        }
+
+        .actions {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 0.5rem 1rem;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #fff;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: background-color 0.15s;
+        }
+
+        button:hover:not(:disabled) {
+            background-color: #f3f4f6;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        button.primary {
+            background-color: #2563eb;
+            color: #fff;
+            border-color: #2563eb;
+        }
+
+        button.primary:hover:not(:disabled) {
+            background-color: #1d4ed8;
+        }
+
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <h1>qpdf-image-streams Playground</h1>
+    <p class="subtitle">Manual testing tool for the WASM module. Load a PDF, inspect images, and download modifications.</p>
+
+    <section>
+        <label for="pdf-input">Select a PDF file:</label>
+        <input type="file" id="pdf-input" accept=".pdf" aria-describedby="file-hint">
+        <div class="drop-zone" id="drop-zone" role="region" aria-label="Drag and drop PDF file here">
+            <p>or drag &amp; drop a PDF here</p>
+        </div>
+        <p id="file-hint" class="hidden">Only .pdf files are supported.</p>
+    </section>
+
+    <section id="status" role="status" aria-live="polite"></section>
+
+    <section id="images-section" class="hidden" aria-label="Image list">
+        <h2>Images Found (<span id="image-count">0</span>)</h2>
+        <div style="overflow-x: auto;">
+            <table id="images-table" aria-label="PDF image metadata">
+                <thead>
+                    <tr>
+                        <th scope="col">Object ID</th>
+                        <th scope="col">Gen</th>
+                        <th scope="col">Width</th>
+                        <th scope="col">Height</th>
+                        <th scope="col">BPC</th>
+                        <th scope="col">Color Space</th>
+                        <th scope="col">Filter</th>
+                        <th scope="col">Stream Length</th>
+                    </tr>
+                </thead>
+                <tbody id="images-tbody"></tbody>
+            </table>
+        </div>
+        <div class="actions">
+            <button id="download-btn" class="primary" disabled aria-label="Download modified PDF">
+                Download Modified PDF
+            </button>
+            <button id="replace-dummy-btn" disabled aria-label="Replace first image with dummy data">
+                Replace First Image (Dummy)
+            </button>
+        </div>
+    </section>
+
+    <script type="module">
+        // --- DOM references ---
+        const fileInput = document.getElementById('pdf-input');
+        const dropZone = document.getElementById('drop-zone');
+        const statusEl = document.getElementById('status');
+        const imagesSection = document.getElementById('images-section');
+        const imagesTbody = document.getElementById('images-tbody');
+        const imageCountEl = document.getElementById('image-count');
+        const downloadBtn = document.getElementById('download-btn');
+        const replaceDummyBtn = document.getElementById('replace-dummy-btn');
+
+        // --- State ---
+        let pdfDoc = null;
+        let qpdf = null;
+
+        // --- Status helpers ---
+        function showStatus(message, type) {
+            statusEl.textContent = '';
+            if (type === 'error' && message.includes('<')) {
+                // Allow HTML for build instructions
+                statusEl.innerHTML = message;
+            } else {
+                statusEl.textContent = message;
+            }
+            statusEl.className = type;
+        }
+
+        function clearStatus() {
+            statusEl.textContent = '';
+            statusEl.className = '';
+            statusEl.style.display = 'none';
+        }
+
+        // --- Initialize WASM module (dynamic import with graceful fallback) ---
+        showStatus('Initializing WASM module...', 'info');
+        fileInput.disabled = true;
+
+        try {
+            const { createQpdfImageStreams } = await import('../dist/index.js');
+
+            qpdf = await createQpdfImageStreams({
+                locateFile: (name) => `../dist/${name}`
+            });
+
+            showStatus('WASM module ready. Select a PDF to get started.', 'success');
+            fileInput.disabled = false;
+        } catch (err) {
+            const isMissing = err.message?.includes('404') ||
+                              err.message?.includes('Failed to fetch') ||
+                              err.message?.includes('Module not found') ||
+                              err instanceof TypeError;
+
+            if (isMissing) {
+                showStatus(
+                    `<strong>Build required.</strong> The WASM module has not been compiled yet.<br><br>` +
+                    `Run these commands from the project root:<br>` +
+                    `<code style="display:block;margin:0.5rem 0;padding:0.5rem;background:#fff;border-radius:4px;">` +
+                    `1. npm run build &nbsp;&nbsp;&nbsp;# compile TypeScript<br>` +
+                    `2. docker build -t qpdf-wasm-builder . &amp;&amp; docker run --rm -v $(pwd)/dist:/out qpdf-wasm-builder &nbsp;&nbsp;&nbsp;# build WASM</code>` +
+                    `<br>Then refresh this page.`,
+                    'error'
+                );
+            } else {
+                showStatus(`Failed to load WASM module: ${err.message}`, 'error');
+            }
+        }
+
+        // --- Load PDF from Uint8Array ---
+        async function handlePdfData(data, filename) {
+            if (!qpdf) {
+                showStatus('Cannot load PDF: WASM module is not available. Please build the project first.', 'error');
+                return;
+            }
+
+            // Close previous document if any
+            if (pdfDoc) {
+                pdfDoc.close();
+                pdfDoc = null;
+            }
+
+            showStatus(`Loading "${filename}"...`, 'info');
+
+            const result = qpdf.loadPdf(data);
+
+            if (!result.ok) {
+                showStatus(`Error loading PDF: ${result.error}`, 'error');
+                imagesSection.classList.add('hidden');
+                return;
+            }
+
+            pdfDoc = result.value;
+
+            // Enumerate images
+            const imagesResult = pdfDoc.getImages({ recursive: true });
+
+            if (!imagesResult.ok) {
+                showStatus(`Error enumerating images: ${imagesResult.error}`, 'error');
+                return;
+            }
+
+            const images = imagesResult.value;
+            showStatus(`Loaded "${filename}" successfully. Found ${images.length} image(s).`, 'success');
+
+            // Populate table
+            imagesTbody.innerHTML = '';
+            imageCountEl.textContent = images.length;
+
+            for (const img of images) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${img.objId}</td>
+                    <td>${img.generation}</td>
+                    <td>${img.width}</td>
+                    <td>${img.height}</td>
+                    <td>${img.bitsPerComponent ?? '<em>null</em>'}</td>
+                    <td>${img.colorSpace ?? '<em>null</em>'}</td>
+                    <td>${img.filter ?? '<em>null</em>'}</td>
+                    <td>${img.streamLength.toLocaleString()} bytes</td>
+                `;
+                imagesTbody.appendChild(row);
+            }
+
+            imagesSection.classList.remove('hidden');
+            downloadBtn.disabled = false;
+            replaceDummyBtn.disabled = images.length === 0;
+        }
+
+        // --- File input handler ---
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const data = new Uint8Array(await file.arrayBuffer());
+            await handlePdfData(data, file.name);
+        });
+
+        // --- Drag and drop ---
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        dropZone.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+
+            const file = e.dataTransfer.files[0];
+            if (!file || !file.name.toLowerCase().endsWith('.pdf')) {
+                showStatus('Please drop a .pdf file.', 'error');
+                return;
+            }
+
+            const data = new Uint8Array(await file.arrayBuffer());
+            await handlePdfData(data, file.name);
+        });
+
+        // --- Download button ---
+        downloadBtn.addEventListener('click', () => {
+            if (!qpdf || !pdfDoc) {
+                showStatus('No PDF loaded.', 'error');
+                return;
+            }
+
+            const writeResult = pdfDoc.writePdf();
+            if (!writeResult.ok) {
+                showStatus(`Error writing PDF: ${writeResult.error}`, 'error');
+                return;
+            }
+
+            const blob = new Blob([writeResult.value], { type: 'application/pdf' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'modified.pdf';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            showStatus('PDF downloaded successfully.', 'success');
+        });
+
+        // --- Replace first image with dummy data ---
+        replaceDummyBtn.addEventListener('click', () => {
+            if (!qpdf || !pdfDoc) {
+                showStatus('No PDF loaded.', 'error');
+                return;
+            }
+
+            const imagesResult = pdfDoc.getImages({ recursive: true });
+            if (!imagesResult.ok || imagesResult.value.length === 0) {
+                showStatus('No images to replace.', 'error');
+                return;
+            }
+
+            const firstImage = imagesResult.value[0];
+            // Create dummy data: fill with zeros matching original stream length
+            const dummyData = new Uint8Array(firstImage.streamLength);
+
+            const replaceResult = pdfDoc.replaceImageStream(
+                firstImage.objId,
+                firstImage.generation,
+                dummyData,
+                {
+                    width: firstImage.width,
+                    height: firstImage.height,
+                    bitsPerComponent: firstImage.bitsPerComponent ?? undefined,
+                    colorSpace: firstImage.colorSpace ?? undefined,
+                    filter: ''  // Remove filter since dummy data is uncompressed
+                }
+            );
+
+            if (!replaceResult.ok) {
+                showStatus(`Error replacing image: ${replaceResult.error}`, 'error');
+                return;
+            }
+
+            showStatus(`Replaced image object ${firstImage.objId} with dummy data. Click "Download Modified PDF" to save.`, 'success');
+        });
+    </script>
+</body>
+</html>

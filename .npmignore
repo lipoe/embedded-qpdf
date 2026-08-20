@@ -1,0 +1,14 @@
+# Development files excluded from npm package
+playground/
+test/
+src/
+patches/
+deps/
+qpdf-src/
+out/
+.kiro/
+.git/
+build-wasm.sh
+Dockerfile
+vitest.config.ts
+tsconfig.json

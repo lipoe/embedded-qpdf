@@ -67,7 +67,8 @@ emcc \
   -s NO_DISABLE_EXCEPTION_CATCHING=1 \
   -s MODULARIZE=1 \
   -s EXPORT_NAME="createQpdfModule" \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' \
+  -s EXPORT_ES6=1 \
+  -s EXPORTED_RUNTIME_METHODS='[]' \
   -s NO_FILESYSTEM=1 \
   -o "$DIST_DIR/qpdf-image-stream.js" \
   "$ROOT/src/wrapper.cpp" \

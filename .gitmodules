@@ -1,0 +1,6 @@
+[submodule "deps/zlib"]
+	path = deps/zlib
+	url = https://github.com/madler/zlib.git
+[submodule "deps/jpeg-turbo"]
+	path = deps/jpeg-turbo
+	url = https://github.com/libjpeg-turbo/libjpeg-turbo.git
