@@ -44,6 +44,8 @@ cd "$ROOT/qpdf-src"
 git clean -xdf 2>/dev/null || true
 emcmake cmake -S . -B build \
   -DCMAKE_INSTALL_PREFIX="$OUT_DIR" \
+  -DCMAKE_PREFIX_PATH="$OUT_DIR" \
+  -DCMAKE_FIND_ROOT_PATH="$OUT_DIR" \
   -DBUILD_SHARED_LIBS=OFF \
   -DBUILD_STATIC_LIBS=ON \
   -DUSE_IMPLICIT_CRYPTO=OFF \
