@@ -351,6 +351,11 @@ public:
             QPDFObjectHandle filterObj = QPDFObjectHandle::newNull();
             QPDFObjectHandle decodeParms = QPDFObjectHandle::newNull();
 
+            // Normalize filter: ensure leading slash (PDF name convention)
+            if (!filter.empty() && filter[0] != '/') {
+                filter = "/" + filter;
+            }
+
             if (!filter.empty()) {
                 // Use the provided filter
                 filterObj = QPDFObjectHandle::newName(filter);

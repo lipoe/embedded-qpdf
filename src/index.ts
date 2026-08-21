@@ -1,12 +1,12 @@
 /**
- * @module @lipoe/embedded-qpdf
+ * @module @lipoe/browser-qpdf
  *
  * Browser-compatible WASM module exposing qpdf's library API for reading
  * and replacing PDF image streams.
  *
  * Usage:
  * ```typescript
- * import { createQpdfImageStreams } from '@lipoe/embedded-qpdf';
+ * import { createQpdfImageStreams } from '@lipoe/browser-qpdf';
  *
  * const qpdf = await createQpdfImageStreams();
  * const result = qpdf.loadPdf(pdfBytes);
@@ -250,12 +250,21 @@ export async function createQpdfImageStreams(
                     try {
                         // Build metadata object for WASM:
                         // 0 for integers and empty string for strings means "preserve original"
+                        // Normalize: strip leading slash from filter/colorSpace if provided,
+                        // the C++ wrapper adds the PDF name prefix automatically.
+                        const normalizeFilter = (v: string) =>
+                            v.startsWith('/') ? v.slice(1) : v;
+
                         const wasmMetadata = {
                             width: metadata?.width ?? 0,
                             height: metadata?.height ?? 0,
                             bitsPerComponent: metadata?.bitsPerComponent ?? 0,
-                            colorSpace: metadata?.colorSpace ?? '',
-                            filter: metadata?.filter ?? '',
+                            colorSpace: metadata?.colorSpace
+                                ? normalizeFilter(metadata.colorSpace)
+                                : '',
+                            filter: metadata?.filter
+                                ? normalizeFilter(metadata.filter)
+                                : '',
                         };
 
                         const result = wrapper.replaceImageStream(

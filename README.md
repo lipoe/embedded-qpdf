@@ -1,4 +1,4 @@
-# @lipoe/embedded-qpdf
+# @lipoe/browser-qpdf
 
 Browser-compatible WASM module exposing qpdf's library API for reading and replacing PDF image streams.
 
@@ -46,7 +46,7 @@ After this you should have `dist/qpdf-image-stream.js`, `dist/qpdf-image-stream.
 ## Usage
 
 ```typescript
-import { createQpdfImageStreams } from '@lipoe/embedded-qpdf';
+import { createQpdfImageStreams } from '@lipoe/browser-qpdf';
 
 const qpdf = await createQpdfImageStreams();
 
@@ -101,6 +101,49 @@ const qpdf = await createQpdfImageStreams({
 });
 ```
 
+## Bundler Usage (Vite, Webpack, etc.)
+
+When using this package with a bundler, the WASM file cannot be resolved automatically. You need to tell the library where to find it using `locateFile`.
+
+### Vite
+
+```typescript
+// Import the WASM URL as a static asset
+import wasmUrl from '@lipoe/browser-qpdf/qpdf-image-stream.wasm?url';
+import { createQpdfImageStreams } from '@lipoe/browser-qpdf';
+
+const qpdf = await createQpdfImageStreams({
+    locateFile: (name) => name.endsWith('.wasm') ? wasmUrl : name,
+});
+```
+
+In your `vite.config.ts`:
+
+```typescript
+export default defineConfig({
+    assetsInclude: ['**/*.wasm'],
+    optimizeDeps: {
+        exclude: ['@lipoe/browser-qpdf'],
+    },
+});
+```
+
+### Webpack / other bundlers
+
+Copy the `.wasm` file to your public/static directory and point `locateFile` to it:
+
+```typescript
+import { createQpdfImageStreams } from '@lipoe/browser-qpdf';
+
+const qpdf = await createQpdfImageStreams({
+    locateFile: (filename) => `/static/${filename}`,
+});
+```
+
+### Why is `locateFile` needed?
+
+Emscripten's generated glue code resolves the `.wasm` file relative to the JS module. After bundling, the JS is typically relocated/renamed while the `.wasm` stays behind, breaking the relative path. `locateFile` gives you explicit control over where the WASM is loaded from.
+
 ## Playground
 
 A browser-based playground is included for quick testing:
@@ -120,7 +163,7 @@ To use this package locally in another project:
 npm link
 
 # In your consumer project
-npm link @lipoe/embedded-qpdf
+npm link @lipoe/browser-qpdf
 ```
 
 ## Testing
@@ -165,6 +208,14 @@ Read raw (compressed) image stream data.
 
 Replace image stream content. Omitted metadata fields preserve original values.
 
+Metadata fields:
+- `width` / `height` — new pixel dimensions
+- `bitsPerComponent` — bits per color component (e.g. 8)
+- `colorSpace` — PDF color space name without leading slash (e.g. `'DeviceRGB'`, `'DeviceGray'`)
+- `filter` — PDF filter name without leading slash (e.g. `'DCTDecode'` for JPEG, `'FlateDecode'` for zlib)
+
+Both `filter` and `colorSpace` accept values with or without a leading `/` — the library normalizes automatically.
+
 ### `PdfDocument.writePdf(): Result<Uint8Array>`
 
 Serialize the (possibly modified) PDF to a new `Uint8Array`.
@@ -175,4 +226,11 @@ Release all WASM memory. After this call, all other methods return an error. Mul
 
 ## License
 
-See repository for license information.
+Apache 2.0. See [LICENSE](./LICENSE).
+
+This package includes compiled code from:
+- [qpdf](https://github.com/qpdf/qpdf) (Apache 2.0)
+- [zlib](https://github.com/madler/zlib) (zlib License)
+- [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo) (BSD 3-Clause / IJG)
+
+See [THIRD-PARTY-NOTICES](./THIRD-PARTY-NOTICES) for full license texts.
