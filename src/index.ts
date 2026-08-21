@@ -1,12 +1,12 @@
 /**
- * @module @emborado/qpdf-image-streams
+ * @module @lipoe/embedded-qpdf
  *
  * Browser-compatible WASM module exposing qpdf's library API for reading
  * and replacing PDF image streams.
  *
  * Usage:
  * ```typescript
- * import { createQpdfImageStreams } from '@emborado/qpdf-image-streams';
+ * import { createQpdfImageStreams } from '@lipoe/embedded-qpdf';
  *
  * const qpdf = await createQpdfImageStreams();
  * const result = qpdf.loadPdf(pdfBytes);

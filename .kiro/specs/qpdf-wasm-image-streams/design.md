@@ -370,7 +370,7 @@ The `outputBuffer_` pattern ensures that `typed_memory_view` pointers remain val
 
 ```json
 {
-  "name": "@emborado/qpdf-image-streams",
+  "name": "@lipoe/embedded-qpdf",
   "type": "module",
   "exports": {
     ".": {

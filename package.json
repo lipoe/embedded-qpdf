@@ -1,7 +1,8 @@
 {
-  "name": "@emborado/qpdf-image-streams",
+  "name": "@lipoe/embedded-qpdf",
   "version": "0.1.0",
   "type": "module",
+  "license": "Apache-2.0",
   "description": "Browser-compatible WASM module exposing qpdf's library API for reading and replacing PDF image streams",
   "exports": {
     ".": {
@@ -13,7 +14,8 @@
     "dist/index.js",
     "dist/index.d.ts",
     "dist/qpdf-image-stream.js",
-    "dist/qpdf-image-stream.wasm"
+    "dist/qpdf-image-stream.wasm",
+    "THIRD-PARTY-NOTICES"
   ],
   "engines": {
     "node": ">=18"
