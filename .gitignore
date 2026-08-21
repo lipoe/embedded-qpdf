@@ -20,3 +20,5 @@ coverage/
 
 # TypeScript build info
 *.tsbuildinfo
+
+.kiro
